@@ -4,7 +4,7 @@
 
 import math
 from functools import partial
-from typing import Tuple, Type
+from typing import Optional, Tuple, Type
 
 import torch
 import torch.nn.functional as F
@@ -12,6 +12,30 @@ from sam3.sam.rope import apply_rotary_enc, apply_rotary_enc_real, compute_axial
 from torch import nn, Tensor
 
 from .common import MLPBlock
+
+
+# >>> START PATCH: masked memory attention >>>
+def _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask: Optional[Tensor], q: Tensor) -> Optional[Tensor]:
+    if memory_key_padding_mask is None:
+        return None
+    if memory_key_padding_mask.dtype is not torch.bool:
+        raise AssertionError(
+            "memory_key_padding_mask must be torch.bool when provided"
+        )
+    if memory_key_padding_mask.dim() != 2:
+        raise AssertionError(
+            "memory_key_padding_mask must have shape [B, memory_len]"
+        )
+    # memory_key_padding_mask uses True=valid and False=padding.
+    padding_mask = (~memory_key_padding_mask).to(device=q.device)
+    attn_mask = torch.zeros(
+        (padding_mask.shape[0], 1, 1, padding_mask.shape[1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    attn_mask.masked_fill_(padding_mask[:, None, None, :], float("-inf"))
+    return attn_mask
+# <<< END PATCH <<<
 
 
 class TwoWayTransformer(nn.Module):
@@ -225,7 +249,7 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -237,6 +261,7 @@ class Attention(nn.Module):
         v = self._separate_heads(v, self.num_heads)
 
         dropout_p = self.dropout_p if self.training else 0.0
+        attn_mask = _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask, q)
         # Attention
         # with torch.backends.cuda.sdp_kernel(
         #     enable_flash=USE_FLASH_ATTN,
@@ -245,7 +270,7 @@ class Attention(nn.Module):
         #     enable_mem_efficient=OLD_GPU,
         # ):
         # Let's trust the dispatcher....
-        if self.use_fa3:
+        if self.use_fa3 and attn_mask is None:
             from sam3.perflib.fa3 import flash_attn_func
 
             assert dropout_p == 0.0
@@ -256,7 +281,7 @@ class Attention(nn.Module):
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
@@ -292,8 +317,8 @@ class RoPEAttention(Attention):
             self.freqs_cis_imag = self.freqs_cis.imag
         self.rope_k_repeat = rope_k_repeat
 
-    def forward(
-        self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0
+    def forward(self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0,
+                memory_key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
         # Input projections
         q = self.q_proj(q)
@@ -332,6 +357,7 @@ class RoPEAttention(Attention):
             )
 
         dropout_p = self.dropout_p if self.training else 0.0
+        attn_mask = _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask, q)
         # Attention
         # with torch.backends.cuda.sdp_kernel(
         #     enable_flash=USE_FLASH_ATTN,
@@ -340,7 +366,7 @@ class RoPEAttention(Attention):
         #     enable_mem_efficient=OLD_GPU,
         # ):
         # Let's trust the dispatcher....
-        if self.use_fa3:
+        if self.use_fa3 and attn_mask is None:
             from sam3.perflib.fa3 import flash_attn_func
 
             assert dropout_p == 0.0
@@ -351,7 +377,7 @@ class RoPEAttention(Attention):
             torch.backends.cuda.enable_flash_sdp(True)
             torch.backends.cuda.enable_math_sdp(True)
             torch.backends.cuda.enable_mem_efficient_sdp(True)
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)
