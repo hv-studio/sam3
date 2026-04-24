@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import os
+from functools import wraps
 from typing import Optional
 
 import pkg_resources
@@ -47,20 +48,22 @@ from sam3.model.tokenizer_ve import SimpleTokenizer
 from sam3.model.video_tracking_multiplex import VideoTrackingDynamicMultiplex
 from sam3.model.vitdet import ViT
 from sam3.model.vl_combiner import SAM3VLBackbone, SAM3VLBackboneTri, TriHeadVisionOnly
+from sam3.perflib.compile import sam3_inference_context
 from sam3.sam.transformer import RoPEAttention
 
 
-# Setup TensorFloat-32 for Ampere GPUs if available
-def _setup_tf32() -> None:
-    """Enable TensorFloat-32 for Ampere GPUs if available."""
-    if torch.cuda.is_available():
-        device_props = torch.cuda.get_device_properties(0)
-        if device_props.major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-
-
-_setup_tf32()
+# >>> CHANGE: do not mutate TF32 backend flags at import time. <<<
+# Original SAM3 implementation:
+# def _setup_tf32() -> None:
+#     """Enable TensorFloat-32 for Ampere GPUs if available."""
+#     if torch.cuda.is_available():
+#         device_props = torch.cuda.get_device_properties(0)
+#         if device_props.major >= 8:
+#             torch.backends.cuda.matmul.allow_tf32 = True
+#             torch.backends.cudnn.allow_tf32 = True
+#
+#
+# _setup_tf32()
 
 
 def _create_position_encoding(precompute_resolution=None):
@@ -570,6 +573,20 @@ def _setup_device_and_mode(model, device, eval_mode):
     return model
 
 
+# >>> CHANGE: preserve SAM3's original TF32 preference without import-time globals. <<<
+def _wrap_model_forward_with_sam3_context(model, *, autocast_dtype=None):
+    """Wrap a public model forward with scoped SAM3 backend precision policy."""
+    original_forward = model.forward
+
+    @wraps(original_forward)
+    def wrapped_forward(*args, **kwargs):
+        with sam3_inference_context(allow_tf32=True, autocast_dtype=autocast_dtype):
+            return original_forward(*args, **kwargs)
+
+    model.forward = wrapped_forward
+    return model
+
+
 def build_sam3_image_model(
     bpe_path=None,
     device="cuda" if torch.cuda.is_available() else "cpu",
@@ -651,7 +668,10 @@ def build_sam3_image_model(
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
 
-    return model
+    # >>> CHANGE: direct image-model users keep SAM3's TF32 preference only during forward. <<<
+    # Original SAM3 implementation:
+    # return model
+    return _wrap_model_forward_with_sam3_context(model, autocast_dtype=None)
 
 
 def download_ckpt_from_hf(version="sam3"):

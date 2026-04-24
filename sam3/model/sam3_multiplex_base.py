@@ -24,6 +24,7 @@ from sam3.model.sam3_video_base import (
     RealizedAssociateDetTrkresult,
     Sam3VideoBase,
 )
+from sam3.perflib.compile import sam3_inference_context
 from sam3.perflib.masks_ops import mask_iou
 from sam3.train.masks_ops import rle_encode
 from torch import nn, Tensor
@@ -33,10 +34,12 @@ SAM3_COLLECTIVE_OP_TIMEOUT_SEC = int(os.getenv("SAM3_COLLECTIVE_OP_TIMEOUT_SEC",
 
 logger = get_logger(__name__)
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+# >>> CHANGE: do not mutate TF32 backend flags at module import time. <<<
+# Original SAM3 implementation:
+# if torch.cuda.get_device_properties(0).major >= 8:
+#     # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+#     torch.backends.cuda.matmul.allow_tf32 = True
+#     torch.backends.cudnn.allow_tf32 = True
 
 
 class Sam3MultiplexTrackerPredictor(nn.Module):
@@ -167,16 +170,30 @@ class Sam3MultiplexTrackerPredictor(nn.Module):
         self.model = model
         self.per_obj_inference = per_obj_inference
         self.fill_hole_area = fill_hole_area
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()  # keep using for the entire model process
+        # >>> CHANGE: keep bf16/TF32 precision policy scoped to delegated model API calls. <<<
+        # Original SAM3 implementation also set:
+        # torch.backends.cuda.matmul.allow_tf32 = True
+        # torch.backends.cudnn.allow_tf32 = True
+        # self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        # self.bf16_context.__enter__()  # keep using for the entire model process
 
     def __getattr__(self, name):
         # Expose all attributes of the underlying model
         model = super().__getattr__("model")
         if name == "model":
             return model
-        return getattr(model, name)
+        attr = getattr(model, name)
+        if callable(attr):
+            # >>> CHANGE: apply SAM3 precision preferences only while delegated model APIs run. <<<
+            def wrapped(*args, **kwargs):
+                with sam3_inference_context(
+                    allow_tf32=True,
+                    autocast_dtype=torch.bfloat16,
+                ):
+                    return attr(*args, **kwargs)
+
+            return wrapped
+        return attr
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError(
@@ -2853,6 +2870,7 @@ class Sam3MultiplexPredictorWrapper(Sam3MultiplexTrackerPredictor):
         self.is_multiplex = is_multiplex
         self.is_multiplex_dynamic = is_multiplex_dynamic
 
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()
+        # >>> CHANGE: keep bf16/TF32 precision policy scoped to delegated model API calls. <<<
+        # Original SAM3 implementation inherited module-level TF32 mutation from this file.
+        # self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        # self.bf16_context.__enter__()

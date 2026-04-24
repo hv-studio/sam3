@@ -1134,25 +1134,35 @@ class Sam3TrackerBase(torch.nn.Module):
 
     def _compile_all_components(self):
         """Compile all model components for faster inference."""
-        # a larger cache size to hold varying number of shapes for torch.compile
-        # see https://github.com/pytorch/pytorch/blob/v2.5.1/torch/_dynamo/config.py#L42-L49
-        torch._dynamo.config.cache_size_limit = 64
-        torch._dynamo.config.accumulated_cache_size_limit = 2048
-        from sam3.perflib.compile import compile_wrapper
+        from sam3.perflib.compile import (
+            SAM3_TRACKER_COMPILE_DYNAMO_CONFIG,
+            compile_wrapper,
+        )
+
+        # >>> CHANGE: preserve tracker Dynamo cache settings without mutating process globals. <<<
+        # Original SAM3 implementation:
+        # torch._dynamo.config.cache_size_limit = 64
+        # torch._dynamo.config.accumulated_cache_size_limit = 2048
+        # from sam3.perflib.compile import compile_wrapper
+        compile_config = SAM3_TRACKER_COMPILE_DYNAMO_CONFIG
 
         logging.info("Compiling all components. First time may be very slow.")
 
+        # >>> CHANGE: preserve original compile_wrapper calls, but pass scoped Dynamo config. <<<
+        # Original SAM3 implementation called compile_wrapper(...) without config=compile_config.
         self.maskmem_backbone.forward = compile_wrapper(
             self.maskmem_backbone.forward,
             mode="max-autotune",
             fullgraph=True,
             dynamic=False,
+            config=compile_config,
         )
         self.transformer.encoder.forward = compile_wrapper(
             self.transformer.encoder.forward,
             mode="max-autotune",
             fullgraph=True,
             dynamic=True,  # Num. of memories varies
+            config=compile_config,
         )
         # We disable compilation of sam_prompt_encoder as it sometimes gives a large accuracy regression,
         # especially when sam_mask_prompt (previous mask logits) is not None
@@ -1167,6 +1177,7 @@ class Sam3TrackerBase(torch.nn.Module):
             mode="max-autotune",
             fullgraph=True,
             dynamic=False,  # Accuracy regression on True
+            config=compile_config,
         )
 
     def _maybe_clone(self, x):

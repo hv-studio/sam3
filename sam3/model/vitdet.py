@@ -28,6 +28,10 @@ except ModuleNotFoundError:
     from timm.models.layers import DropPath, trunc_normal_
 from sam3.model.data_misc import NestedTensor
 from sam3.model.model_misc import AttentionType, LayerScale
+from sam3.perflib.compile import (
+    SAM3_ACT_CKPT_DYNAMO_CONFIG,
+    compile_with_dynamo_config,
+)
 from sam3.perflib.fused import addmm_act
 from sam3.sam.rope import apply_rotary_enc_real, VisionRotaryEmbeddingVE
 from torch import Tensor
@@ -932,11 +936,23 @@ class ViT(nn.Module):
         self.apply(self._init_weights)
 
         if compile_mode is not None:
-            self.forward = torch.compile(
-                self.forward, mode=compile_mode, fullgraph=True
+            # >>> CHANGE: scope activation-checkpoint Dynamo-DDP config to compiled calls. <<<
+            # Original SAM3 implementation:
+            # self.forward = torch.compile(
+            #     self.forward, mode=compile_mode, fullgraph=True
+            # )
+            # if self.use_act_checkpoint and self.training:
+            #     torch._dynamo.config.optimize_ddp = False
+            self.forward = compile_with_dynamo_config(
+                self.forward,
+                mode=compile_mode,
+                fullgraph=True,
+                config=(
+                    SAM3_ACT_CKPT_DYNAMO_CONFIG
+                    if self.use_act_checkpoint and self.training
+                    else None
+                ),
             )
-            if self.use_act_checkpoint and self.training:
-                torch._dynamo.config.optimize_ddp = False
 
     def _init_weights(self, m: nn.Module) -> None:
         if isinstance(m, nn.Linear):

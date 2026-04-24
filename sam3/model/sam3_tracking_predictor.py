@@ -9,6 +9,7 @@ import torch
 from sam3.model.sam3_tracker_base import concat_points, NO_OBJ_SCORE, Sam3TrackerBase
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.utils.sam2_utils import load_video_frames
+from sam3.perflib.compile import sam3_inference_context
 from tqdm.auto import tqdm
 
 
@@ -47,11 +48,45 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
 
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()  # keep using for the entire model process
+        # >>> CHANGE: scope bf16 autocast to public predictor calls instead of entering a long-lived context. <<<
+        # Original SAM3 implementation:
+        # self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        # self.bf16_context.__enter__()  # keep using for the entire model process
 
         self.iter_use_prev_mask_pred = True
         self.add_all_frames_to_correct_as_cond = True
+
+    def __getattribute__(self, name):
+        attr = super().__getattribute__(name)
+        scoped_methods = {
+            "init_state",
+            "add_new_points_or_box",
+            "add_new_mask",
+            "propagate_in_video_preflight",
+            "propagate_in_video",
+            "clear_all_points_in_frame",
+            "clear_all_points_in_video",
+            "remove_object",
+        }
+        if name in scoped_methods and callable(attr):
+            # >>> CHANGE: apply SAM3 precision preferences only while predictor APIs run. <<<
+            if name == "propagate_in_video":
+                def wrapped(*args, **kwargs):
+                    with sam3_inference_context(
+                        allow_tf32=True,
+                        autocast_dtype=torch.bfloat16,
+                    ):
+                        yield from attr(*args, **kwargs)
+            else:
+                def wrapped(*args, **kwargs):
+                    with sam3_inference_context(
+                        allow_tf32=True,
+                        autocast_dtype=torch.bfloat16,
+                    ):
+                        return attr(*args, **kwargs)
+
+            return wrapped
+        return attr
 
     @torch.inference_mode()
     def init_state(

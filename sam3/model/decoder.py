@@ -16,7 +16,7 @@ import torch.nn.functional as torchF
 from sam3.sam.rope import apply_rotary_enc, apply_rotary_enc_real, compute_axial_cis
 from sam3.sam.transformer import RoPEAttention
 from torch import nn, Tensor
-from torch.nn.attention import sdpa_kernel, SDPBackend
+# >>> CHANGE: do not import SDPA policy helpers in SAM3; MDSTL wraps the boundary. <<<
 from torchvision.ops.roi_align import RoIAlign
 
 from .act_ckpt_utils import activation_ckpt_wrapper
@@ -1039,12 +1039,8 @@ def functional_attention(
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel([
-            SDPBackend.FLASH_ATTENTION,
-            SDPBackend.EFFICIENT_ATTENTION,
-            SDPBackend.MATH,
-        ]):
-            out = torchF.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout)
+        # >>> CHANGE: leave SDPA backend policy to the MDSTL SAM3 Guider boundary. <<<
+        out = torchF.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 
     out = out.reshape(b, n, cv)

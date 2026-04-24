@@ -15,6 +15,7 @@ from typing import Dict, Optional
 import torch
 from sam3.logger import get_logger
 from sam3.model.sam3_base_predictor import Sam3BasePredictor
+from sam3.perflib.compile import sam3_inference_context
 
 logger = get_logger(__name__)
 
@@ -44,17 +45,34 @@ class Sam3MultiplexVideoPredictor(Sam3BasePredictor):
         self.default_output_prob_thresh = default_output_prob_thresh
         self.async_loading_frames = async_loading_frames
 
-        # turn on tfloat32 for Ampere GPUs
-        torch.backends.cuda.matmul.allow_tf32 = True
-        torch.backends.cudnn.allow_tf32 = True
-        # use bfloat16 inference for Flash Attention kernel
-        self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
-        self.bf16_context.__enter__()
+        # >>> CHANGE: scope TF32 backend flags to request handling instead of mutating process globals. <<<
+        # Original SAM3 implementation:
+        # torch.backends.cuda.matmul.allow_tf32 = True
+        # torch.backends.cudnn.allow_tf32 = True
+        # >>> CHANGE: scope bf16 autocast to request handling instead of entering a long-lived context. <<<
+        # Original SAM3 implementation:
+        # self.bf16_context = torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+        # self.bf16_context.__enter__()
 
         if warm_up:
             self.model._warm_up_complete = False
-            self.model.warm_up_compilation()
+            with sam3_inference_context(allow_tf32=True, autocast_dtype=torch.bfloat16):
+                self.model.warm_up_compilation()
             self.model._warm_up_complete = True
+
+    @torch.inference_mode()
+    def handle_request(self, request):
+        """Dispatch one request under SAM3's scoped backend preference."""
+        # >>> CHANGE: apply SAM3 precision preferences only while predictor APIs run. <<<
+        with sam3_inference_context(allow_tf32=True, autocast_dtype=torch.bfloat16):
+            return super().handle_request(request)
+
+    @torch.inference_mode()
+    def handle_stream_request(self, request):
+        """Dispatch one stream request under SAM3's scoped backend preference."""
+        # >>> CHANGE: apply SAM3 precision preferences only while predictor APIs run. <<<
+        with sam3_inference_context(allow_tf32=True, autocast_dtype=torch.bfloat16):
+            yield from super().handle_stream_request(request)
 
     def _extend_expiration_time(self, session):
         """Update last-use time and store session expiration timeout."""
