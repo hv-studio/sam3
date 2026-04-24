@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import logging
 import math
 import os
@@ -185,12 +186,25 @@ class Sam3MultiplexTrackerPredictor(nn.Module):
         attr = getattr(model, name)
         if callable(attr):
             # >>> CHANGE: apply SAM3 precision preferences only while delegated model APIs run. <<<
-            def wrapped(*args, **kwargs):
-                with sam3_inference_context(
-                    allow_tf32=True,
-                    autocast_dtype=torch.bfloat16,
-                ):
-                    return attr(*args, **kwargs)
+            # Generator methods (e.g. `propagate_in_video`) must keep the context open
+            # across yields, so `return attr(...)` would exit the `with` block before
+            # iteration begins. Route generator functions through `yield from` instead.
+            if inspect.isgeneratorfunction(
+                attr.__func__ if hasattr(attr, "__func__") else attr
+            ):
+                def wrapped(*args, **kwargs):
+                    with sam3_inference_context(
+                        allow_tf32=True,
+                        autocast_dtype=torch.bfloat16,
+                    ):
+                        yield from attr(*args, **kwargs)
+            else:
+                def wrapped(*args, **kwargs):
+                    with sam3_inference_context(
+                        allow_tf32=True,
+                        autocast_dtype=torch.bfloat16,
+                    ):
+                        return attr(*args, **kwargs)
 
             return wrapped
         return attr

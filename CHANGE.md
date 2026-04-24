@@ -163,6 +163,9 @@ What changed:
   `sam3_multiplex_video_predictor.py`.
 - Replaced long-lived predictor `bf16_context.__enter__()` usage with scoped
   `sam3_inference_context(...)` around public predictor API calls.
+- In `Sam3MultiplexTrackerPredictor.__getattr__(...)`, route delegated generator
+  methods, such as `propagate_in_video(...)`, through a generator wrapper that
+  keeps `sam3_inference_context(...)` open across `yield` points.
 
 Why:
 
@@ -171,6 +174,9 @@ Why:
   in the same process inherit SAM3's choices.
 - Native SAM3-vs-MDSTL comparisons should explicitly control and record backend
   precision policy.
+- Generator functions do not execute when called; they only create a generator
+  object. A scoped wrapper that simply returned `attr(...)` would exit the SAM3
+  inference context before video propagation actually ran.
 
 Risk / behavior notes:
 
@@ -180,6 +186,9 @@ Risk / behavior notes:
 - `build_sam3_image_model(...)` is wrapped with `autocast_dtype=None` on
   purpose. The original image-model builder only enabled TF32 globally; it did
   not add a default bf16 autocast policy for direct image forward calls.
+- Delegated generator predictor APIs now enter the scoped SAM3 inference context
+  on first iteration and exit when the generator is exhausted or closed, matching
+  the actual execution lifetime of video propagation.
 - Code that bypasses predictor APIs and calls lower-level model methods directly
   must provide its own precision context, just like MDSTL's SAM3 Guider does.
 - `sam3/train/trainer.py` still owns its training-process backend setup. That is
@@ -265,6 +274,15 @@ Checks run while preparing these changes:
   - SAM3 inference/import-time `torch.backends.*` assignments
 - Small runtime checks that scoped Dynamo/backend contexts restore the previous
   process state after exit.
+- Lightweight generator-wrapper check for `Sam3MultiplexTrackerPredictor`-style
+  delegation:
+  - regular delegated callables enter and exit `sam3_inference_context(...)`
+    during the call;
+  - delegated generator callables enter on first `next(...)`, stay inside the
+    context across yielded values, and exit on exhaustion or early
+    `generator.close()`;
+  - wrapped generator callables remain detectable by
+    `inspect.isgeneratorfunction(...)`.
 
 Expected remaining backend writes:
 
