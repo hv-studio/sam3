@@ -245,6 +245,35 @@ Risk / behavior notes:
 - This is acceptable for MDSTL's fixed-shape compile paths, but callers outside
   MDSTL should keep input validation at their own boundary if needed.
 
+### 5. Parameterize Transformer Decoder Resolution and Stride
+
+File:
+
+- `sam3/model_builder.py`
+
+What changed:
+
+- Made `_create_transformer_decoder(...)` accept optional `resolution` and
+  `stride` arguments instead of hard-coding `1008` and `14`.
+- Threaded the same optional arguments through
+  `_create_sam3_transformer(...)`, so callers can override decoder geometry
+  from the top-level builder.
+- Kept the previous defaults unchanged for existing call sites.
+
+Why:
+
+- SAM3 integration can now adapt decoder geometry without editing the builder
+  internals.
+- This keeps the local vendored tree closer to the upstream structure while
+  still exposing the knobs needed by MDSTL-side model wiring.
+
+Risk / behavior notes:
+
+- Existing users that rely on default SAM3 behavior should see no change,
+  because the defaults remain `resolution=1008` and `stride=14`.
+- Callers that pass custom values now have a supported path instead of
+  patching the source locally.
+
 ## MDSTL-Side Contract
 
 MDSTL mirrors these SAM3 changes at the integration boundary:

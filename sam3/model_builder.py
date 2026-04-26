@@ -165,7 +165,10 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
     return encoder
 
 
-def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
+# >>> CHANGE: make resolution and stride optional <<<
+def _create_transformer_decoder(
+    use_fa3=False, *, resolution: int | None = 1008, stride: int | None = 14,
+) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -195,8 +198,8 @@ def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
         frozen=False,
         interaction_layer=None,
         dac_use_selfatt_ln=True,
-        resolution=1008,
-        stride=14,
+        resolution=resolution,
+        stride=stride,
         use_act_checkpoint=True,
         presence_token=True,
     )
@@ -529,12 +532,18 @@ def _create_vision_backbone(
     return vit_neck
 
 
+# >>> CHANGE: make resolution and stride optional <<<
 def _create_sam3_transformer(
-    has_presence_token: bool = True, use_fa3: bool = False
+    has_presence_token: bool = True, use_fa3: bool = False,
+    *,
+    resolution: int | None = 1008, stride: int | None = 14,
 ) -> TransformerWrapper:
-    """Create SAM3 transformer encoder and decoder."""
+    """
+    Create SAM3 transformer encoder and decoder.
+    Set `resolution=None & stride=None` to prevent from precaching CUDA values.
+    """
     encoder: TransformerEncoderFusion = _create_transformer_encoder(use_fa3=use_fa3)
-    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3)
+    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3, resolution=resolution, stride=stride)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
