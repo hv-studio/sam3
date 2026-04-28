@@ -66,14 +66,15 @@ from sam3.sam.transformer import RoPEAttention
 # _setup_tf32()
 
 
-def _create_position_encoding(precompute_resolution=None):
+# >>> CHANGE: rename the position-cache knob to `resolution` for builder consistency. <<<
+def _create_position_encoding(resolution=None):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
         num_pos_feats=256,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=precompute_resolution,
+        precompute_resolution=resolution,
     )
 
 
@@ -347,16 +348,23 @@ def _create_sam3_model(
     return model
 
 
-def _create_tracker_maskmem_backbone():
-    """Create the SAM3 Tracker memory encoder."""
-    # Position encoding for mask memory backbone
-    position_encoding = PositionEmbeddingSine(
+# >>> CHANGE: split tracker maskmem position encoding into a reusable builder helper. <<<
+def _create_tracker_maskmem_position_encoding(*, resolution: int | None = 1008):
+    """Create tracker mask-memory position encoding."""
+    return PositionEmbeddingSine(
         num_pos_feats=64,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=1008,
+        precompute_resolution=resolution,
     )
+
+
+# >>> CHANGE: make tracker maskmem position-cache resolution optional. <<<
+def _create_tracker_maskmem_backbone(*, resolution: int | None = 1008):
+    """Create the SAM3 Tracker memory encoder."""
+    # Position encoding for mask memory backbone
+    position_encoding = _create_tracker_maskmem_position_encoding(resolution=resolution)
 
     # Mask processing components
     mask_downsampler = SimpleMaskDownSampler(
@@ -515,12 +523,13 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     )
 
 
+# >>> CHANGE: make visual-backbone position-cache resolution optional. <<<
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, *, resolution: int | None = 1008,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(resolution=resolution)
     # ViT backbone
     vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
@@ -950,7 +959,7 @@ def _create_multiplex_tri_backbone(
     compile_mode=None, use_fa3=False, use_rope_real=False
 ):
     """Create the TriHead vision backbone for multiplex model."""
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(resolution=1008)
     vit_backbone = _create_vit_backbone(
         compile_mode=compile_mode, use_fa3=use_fa3, use_rope_real=use_rope_real
     )

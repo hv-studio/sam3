@@ -274,6 +274,44 @@ Risk / behavior notes:
 - Callers that pass custom values now have a supported path instead of
   patching the source locally.
 
+### 6. Parameterize Builder Position-Cache Resolution
+
+File:
+
+- `sam3/model_builder.py`
+
+What changed:
+
+- Renamed `_create_position_encoding(...)`'s cache-control argument from
+  `precompute_resolution` to `resolution`.
+- Added `_create_tracker_maskmem_position_encoding(...)` so tracker memory
+  encoding can expose its own resolution knob without overloading the visual
+  backbone helper's semantics.
+- Made `_create_tracker_maskmem_backbone(...)` accept optional
+  `resolution=1008` and route it into the new tracker maskmem position-encoding
+  helper.
+- Made `_create_vision_backbone(...)` accept optional `resolution=1008` and
+  route it into `_create_position_encoding(...)`.
+- Updated internal builder call sites to the new `resolution=...` keyword.
+
+Why:
+
+- MDSTL's reconstructed SAM3 adapters need to disable eager CUDA position-cache
+  precompute during construction and leave first-use cache materialization to
+  explicit warmup paths.
+- Using `resolution` keeps the naming aligned with the earlier
+  `_create_transformer_decoder(...)` patch instead of introducing a separate
+  one-off builder keyword.
+- Splitting tracker maskmem positional encoding into its own helper keeps the
+  visual-backbone and tracker-memory builder layers semantically distinct.
+
+Risk / behavior notes:
+
+- Existing SAM3 builder call sites keep the previous behavior because the new
+  defaults remain `resolution=1008` where precompute was previously hard-coded.
+- Callers can now pass `resolution=None` to bypass eager position-cache
+  precompute without locally rewriting builder internals.
+
 ## MDSTL-Side Contract
 
 MDSTL mirrors these SAM3 changes at the integration boundary:
