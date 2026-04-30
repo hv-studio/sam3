@@ -159,6 +159,7 @@ class PromptEncoder(nn.Module):
         points: Optional[Tuple[torch.Tensor, torch.Tensor]],
         boxes: Optional[torch.Tensor],
         masks: Optional[torch.Tensor],
+        enable_dummy_boxes: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Embeds different types of prompts, returning both sparse and dense
@@ -169,6 +170,11 @@ class PromptEncoder(nn.Module):
             and labels to embed.
           boxes (torch.Tensor or none): boxes to embed
           masks (torch.Tensor or none): masks to embed
+          enable_dummy_boxes (bool): whether to append SAM3's native dummy
+            point when `boxes is None`. Keeping the default `True` preserves
+            upstream behavior. Callers that explicitly manage sparse prompt
+            padding can set this to `False` and construct the final
+            key-padding mask outside the prompt encoder.
 
         Returns:
           torch.Tensor: sparse embeddings for the points and boxes, with shape
@@ -183,7 +189,8 @@ class PromptEncoder(nn.Module):
         )
         if points is not None:
             coords, labels = points
-            point_embeddings = self._embed_points(coords, labels, pad=(boxes is None))
+            pad_points = enable_dummy_boxes and boxes is None
+            point_embeddings = self._embed_points(coords, labels, pad=pad_points)
             sparse_embeddings = torch.cat([sparse_embeddings, point_embeddings], dim=1)
         if boxes is not None:
             box_embeddings = self._embed_boxes(boxes)

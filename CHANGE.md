@@ -1,8 +1,8 @@
 # SAM3 Local Change Log
 
 - Upstream source: https://github.com/facebookresearch/sam3
-- Local branch inspected: `v0.1.2`
-- Summary updated: 2026-04-25
+- Local branch inspected: `v0.1.4`
+- Summary updated: 2026-05-01
 
 This file records the intentional local differences in this vendored SAM3 tree.
 It includes committed changes in the nested `thirdparty/sam3` git repository
@@ -312,6 +312,70 @@ Risk / behavior notes:
 - Callers can now pass `resolution=None` to bypass eager position-cache
   precompute without locally rewriting builder internals.
 
+### 7. Add Sparse Prompt Padding-Mask Attention Support
+
+Files:
+
+- `sam3/sam/prompt_encoder.py`
+- `sam3/sam/mask_decoder.py`
+- `sam3/sam/transformer.py`
+- `sam3/model/sam3_tracker_base.py`
+- `sam3/model/video_tracking_multiplex.py`
+
+What changed:
+
+- Extended `PromptEncoder.forward(...)` with optional
+  `enable_dummy_boxes`, defaulting to `True` to preserve upstream SAM3
+  behavior.
+- `PromptEncoder` remains responsible only for prompt embedding. Sparse-prompt
+  padding masks are now assembled outside the prompt encoder so MDSTL can
+  manage fixed-slot batching explicitly.
+- Extended `MaskDecoder.forward(...)` and `predict_masks(...)` with optional
+  `sparse_prompt_key_padding_mask`.
+- `MaskDecoder` now prepends a valid prefix for SAM output tokens and then
+  concatenates the sparse-prompt padding mask before entering the two-way
+  transformer.
+- Extended `TwoWayTransformer`, `TwoWayAttentionBlock`, `Attention`, and
+  `RoPEAttention` with a prompt-token key-padding-mask path separate from the
+  existing memory mask path.
+- Threaded optional `point_key_padding_mask` through
+  `Sam3TrackerBase._forward_sam_heads(...)` and the interactive path in
+  `video_tracking_multiplex.py`.
+
+Why:
+
+- MDSTL stage-1-enhance needs fixed-slot sparse prompt batching with a prompt
+  attention mask, instead of relying on extra `label == -1` tokens as fake
+  padding.
+- Native SAM3 `label == -1` tokens are semantically meaningful
+  `not_a_point_embed` tokens, not ignorable padding. Without an explicit prompt
+  key-padding mask, padding to a shared `P_max` changes decoder behavior.
+- Keeping native dummy-point insertion as an explicit `PromptEncoder`
+  compatibility switch avoids forcing MDSTL to reimplement `boxes is None`
+  dummy-point behavior at the integration boundary.
+
+Risk / behavior notes:
+
+- Prompt padding-mask semantics intentionally follow standard PyTorch
+  key-padding-mask convention:
+  - `True = padding`
+  - `False = valid`
+- This differs from the earlier local `memory_key_padding_mask` patch, where
+  SAM3-compatible memory masks still use:
+  - `True = valid`
+  - `False = padding`
+- The prompt mask is only applied where sparse prompt tokens act as keys/values:
+  - sparse-token self-attention
+  - image-to-token cross-attention
+- The prompt mask is not applied to token-to-image attention, because that path
+  attends over image tokens rather than sparse prompt tokens.
+- Masked prompt calls are no longer eligible for the FA3 fast path in
+  `sam3/sam/transformer.py`; they fall back to SDPA because an additive
+  attention mask is now present.
+- Existing call sites remain source-compatible because all new mask arguments
+  are optional, and old callers that ignore prompt padding continue to get the
+  previous behavior.
+
 ## MDSTL-Side Contract
 
 MDSTL mirrors these SAM3 changes at the integration boundary:
@@ -332,6 +396,17 @@ MDSTL mirrors these SAM3 changes at the integration boundary:
 Checks run while preparing these changes:
 
 - `py_compile` on modified SAM3 files touched by Dynamo/backend changes.
+- `py_compile` on modified SAM3 files touched by sparse prompt padding-mask
+  attention changes:
+  - `sam3/sam/prompt_encoder.py`
+  - `sam3/sam/mask_decoder.py`
+  - `sam3/sam/transformer.py`
+  - `sam3/model/sam3_tracker_base.py`
+- `py_compile` on unchanged compatibility call sites that exercise the updated
+  prompt-encoder / mask-decoder interfaces:
+  - `sam3/model/sam1_task_predictor.py`
+  - `sam3/model/video_tracking_multiplex.py`
+  - `sam3/model/multiplex_mask_decoder.py`
 - `rg` checks for active direct writes to:
   - `torch._dynamo.config.cache_size_limit`
   - `torch._dynamo.config.accumulated_cache_size_limit`

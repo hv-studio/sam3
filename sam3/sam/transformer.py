@@ -19,13 +19,9 @@ def _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask: Optional[Tens
     if memory_key_padding_mask is None:
         return None
     if memory_key_padding_mask.dtype is not torch.bool:
-        raise AssertionError(
-            "memory_key_padding_mask must be torch.bool when provided"
-        )
+        raise AssertionError("memory_key_padding_mask must be torch.bool when provided")
     if memory_key_padding_mask.dim() != 2:
-        raise AssertionError(
-            "memory_key_padding_mask must have shape [B, memory_len]"
-        )
+        raise AssertionError("memory_key_padding_mask must have shape [B, memory_len]")
     # memory_key_padding_mask uses True=valid and False=padding.
     padding_mask = (~memory_key_padding_mask).to(device=q.device)
     attn_mask = torch.zeros(
@@ -34,6 +30,22 @@ def _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask: Optional[Tens
         device=q.device,
     )
     attn_mask.masked_fill_(padding_mask[:, None, None, :], float("-inf"))
+    return attn_mask
+
+
+def _key_padding_mask_to_attn_mask(key_padding_mask: Optional[Tensor], q: Tensor) -> Optional[Tensor]:
+    if key_padding_mask is None:
+        return None
+    if key_padding_mask.dtype is not torch.bool:
+        raise AssertionError("key_padding_mask must be torch.bool when provided")
+    if key_padding_mask.dim() != 2:
+        raise AssertionError("key_padding_mask must have shape [B, seq_len]")
+    attn_mask = torch.zeros(
+        (key_padding_mask.shape[0], 1, 1, key_padding_mask.shape[1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    attn_mask.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
     return attn_mask
 # <<< END PATCH <<<
 
@@ -88,7 +100,8 @@ class TwoWayTransformer(nn.Module):
         self,
         image_embedding: Tensor,
         image_pe: Tensor,
-        point_embedding: Tensor,
+        token_embedding: Tensor,
+        token_key_padding_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
         Args:
@@ -96,11 +109,16 @@ class TwoWayTransformer(nn.Module):
             B x embedding_dim x h x w for any h and w.
           image_pe (torch.Tensor): the positional encoding to add to the image. Must
             have the same shape as image_embedding.
-          point_embedding (torch.Tensor): the embedding to add to the query points.
-            Must have shape B x N_points x embedding_dim for any N_points.
+          token_embedding (torch.Tensor): the full token sequence consumed by the
+            two-way transformer. In the SAM mask-decoder path this already
+            includes both output tokens and sparse prompt tokens, with shape
+            B x N_tokens x embedding_dim.
+          token_key_padding_mask (torch.Tensor or none): optional padding mask
+            for the full token sequence in `token_embedding`, with shape BxN and
+            `True` indicating padding.
 
         Returns:
-          torch.Tensor: the processed point_embedding
+          torch.Tensor: the processed token_embedding
           torch.Tensor: the processed image_embedding
         """
         # BxCxHxW -> BxHWxC == B x N_image_tokens x C
@@ -109,7 +127,7 @@ class TwoWayTransformer(nn.Module):
         image_pe = image_pe.flatten(2).permute(0, 2, 1)
 
         # Prepare queries
-        queries = point_embedding
+        queries = token_embedding
         keys = image_embedding
 
         # Apply transformer blocks and final layernorm
@@ -117,12 +135,13 @@ class TwoWayTransformer(nn.Module):
             queries, keys = layer(
                 queries=queries,
                 keys=keys,
-                query_pe=point_embedding,
+                query_pe=token_embedding,
                 key_pe=image_pe,
+                query_key_padding_mask=token_key_padding_mask,
             )
 
-        # Apply the final attention layer from the points to the image
-        q = queries + point_embedding
+        # Apply the final attention layer from the token sequence to the image
+        q = queries + token_embedding
         k = keys + image_pe
         attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
@@ -174,14 +193,29 @@ class TwoWayAttentionBlock(nn.Module):
         self.skip_first_layer_pe = skip_first_layer_pe
 
     def forward(
-        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
+        self,
+        queries: Tensor,
+        keys: Tensor,
+        query_pe: Tensor,
+        key_pe: Tensor,
+        query_key_padding_mask: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
         # Self attention block
         if self.skip_first_layer_pe:
-            queries = self.self_attn(q=queries, k=queries, v=queries)
+            queries = self.self_attn(
+                q=queries,
+                k=queries,
+                v=queries,
+                key_padding_mask=query_key_padding_mask,
+            )
         else:
             q = queries + query_pe
-            attn_out = self.self_attn(q=q, k=q, v=queries)
+            attn_out = self.self_attn(
+                q=q,
+                k=q,
+                v=queries,
+                key_padding_mask=query_key_padding_mask,
+            )
             queries = queries + attn_out
         queries = self.norm1(queries)
 
@@ -200,7 +234,12 @@ class TwoWayAttentionBlock(nn.Module):
         # Cross attention block, image embedding attending to tokens
         q = queries + query_pe
         k = keys + key_pe
-        attn_out = self.cross_attn_image_to_token(q=k, k=q, v=queries)
+        attn_out = self.cross_attn_image_to_token(
+            q=k,
+            k=q,
+            v=queries,
+            key_padding_mask=query_key_padding_mask,
+        )
         keys = keys + attn_out
         keys = self.norm4(keys)
 
@@ -249,7 +288,18 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+    def forward(
+        self,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        memory_key_padding_mask: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
+    ) -> Tensor:
+        if memory_key_padding_mask is not None and key_padding_mask is not None:
+            raise AssertionError(
+                "memory_key_padding_mask and key_padding_mask are mutually exclusive"
+            )
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -261,7 +311,12 @@ class Attention(nn.Module):
         v = self._separate_heads(v, self.num_heads)
 
         dropout_p = self.dropout_p if self.training else 0.0
-        attn_mask = _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask, q)
+        if key_padding_mask is not None:
+            attn_mask = _key_padding_mask_to_attn_mask(key_padding_mask, q)
+        else:
+            attn_mask = _memory_key_padding_mask_to_attn_mask(
+                memory_key_padding_mask, q
+            )
         # Attention
         # with torch.backends.cuda.sdp_kernel(
         #     enable_flash=USE_FLASH_ATTN,
@@ -317,7 +372,12 @@ class RoPEAttention(Attention):
 
     def forward(self, q: Tensor, k: Tensor, v: Tensor, num_k_exclude_rope: int = 0,
                 memory_key_padding_mask: Optional[Tensor] = None,
+                key_padding_mask: Optional[Tensor] = None,
     ) -> Tensor:
+        if memory_key_padding_mask is not None and key_padding_mask is not None:
+            raise AssertionError(
+                "memory_key_padding_mask and key_padding_mask are mutually exclusive"
+            )
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -355,7 +415,12 @@ class RoPEAttention(Attention):
             )
 
         dropout_p = self.dropout_p if self.training else 0.0
-        attn_mask = _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask, q)
+        if key_padding_mask is not None:
+            attn_mask = _key_padding_mask_to_attn_mask(key_padding_mask, q)
+        else:
+            attn_mask = _memory_key_padding_mask_to_attn_mask(
+                memory_key_padding_mask, q
+            )
         # Attention
         # with torch.backends.cuda.sdp_kernel(
         #     enable_flash=USE_FLASH_ATTN,

@@ -720,6 +720,9 @@ class VideoTrackingMultiplex(nn.Module):
             if point_inputs is not None:
                 sam_point_coords = point_inputs["point_coords"]
                 sam_point_labels = point_inputs["point_labels"]
+                sam_point_key_padding_mask = point_inputs.get(
+                    "point_key_padding_mask", None
+                )
             else:
                 assert mask_inputs is not None
                 # If no points are provided, pad with an empty point (with label -1)
@@ -729,6 +732,7 @@ class VideoTrackingMultiplex(nn.Module):
                 sam_point_labels = -torch.ones(
                     mask_inputs.shape[0], 1, dtype=torch.int32, device=device
                 )
+                sam_point_key_padding_mask = None
 
             # b) Handle mask prompts
             if mask_inputs is not None:
@@ -758,6 +762,28 @@ class VideoTrackingMultiplex(nn.Module):
                 boxes=None,
                 masks=sam_mask_prompt,
             )
+            if sam_point_key_padding_mask is None:
+                sparse_prompt_key_padding_mask = None
+            else:
+                if sam_point_key_padding_mask.dtype is not torch.bool:
+                    raise AssertionError(
+                        "point_key_padding_mask must be torch.bool when provided"
+                    )
+                if sam_point_key_padding_mask.shape != sam_point_labels.shape:
+                    raise AssertionError(
+                        "point_key_padding_mask must have shape [B, num_points]"
+                    )
+                sparse_prompt_key_padding_mask = torch.cat(
+                    [
+                        sam_point_key_padding_mask.to(device=device),
+                        torch.zeros(
+                            (sam_point_labels.shape[0], 1),
+                            dtype=torch.bool,
+                            device=device,
+                        ),
+                    ],
+                    dim=1,
+                )
 
             # Clone image_pe and the outputs of sam_prompt_encoder
             # to enable compilation
@@ -775,6 +801,7 @@ class VideoTrackingMultiplex(nn.Module):
                 image_embeddings=backbone_features,
                 image_pe=image_pe,
                 sparse_prompt_embeddings=sparse_embeddings,
+                sparse_prompt_key_padding_mask=sparse_prompt_key_padding_mask,
                 dense_prompt_embeddings=dense_embeddings,
                 multimask_output=multimask_output,
                 repeat_image=True,
