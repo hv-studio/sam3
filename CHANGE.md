@@ -319,8 +319,6 @@ Files:
 - `sam3/sam/prompt_encoder.py`
 - `sam3/sam/mask_decoder.py`
 - `sam3/sam/transformer.py`
-- `sam3/model/sam3_tracker_base.py`
-- `sam3/model/video_tracking_multiplex.py`
 
 What changed:
 
@@ -331,16 +329,13 @@ What changed:
   padding masks are now assembled outside the prompt encoder so MDSTL can
   manage fixed-slot batching explicitly.
 - Extended `MaskDecoder.forward(...)` and `predict_masks(...)` with optional
-  `sparse_prompt_key_padding_mask`.
+  `sparse_key_padding_mask`.
 - `MaskDecoder` now prepends a valid prefix for SAM output tokens and then
   concatenates the sparse-prompt padding mask before entering the two-way
   transformer.
 - Extended `TwoWayTransformer`, `TwoWayAttentionBlock`, `Attention`, and
   `RoPEAttention` with a prompt-token key-padding-mask path separate from the
   existing memory mask path.
-- Threaded optional `point_key_padding_mask` through
-  `Sam3TrackerBase._forward_sam_heads(...)` and the interactive path in
-  `video_tracking_multiplex.py`.
 
 Why:
 
@@ -401,7 +396,6 @@ Checks run while preparing these changes:
   - `sam3/sam/prompt_encoder.py`
   - `sam3/sam/mask_decoder.py`
   - `sam3/sam/transformer.py`
-  - `sam3/model/sam3_tracker_base.py`
 - `py_compile` on unchanged compatibility call sites that exercise the updated
   prompt-encoder / mask-decoder interfaces:
   - `sam3/model/sam1_task_predictor.py`

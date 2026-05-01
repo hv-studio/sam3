@@ -115,7 +115,7 @@ class MaskDecoder(nn.Module):
         multimask_output: bool,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
-        sparse_prompt_key_padding_mask: Optional[torch.Tensor] = None,
+        sparse_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -124,7 +124,7 @@ class MaskDecoder(nn.Module):
           image_embeddings (torch.Tensor): the embeddings from the image encoder
           image_pe (torch.Tensor): positional encoding with the shape of image_embeddings
           sparse_prompt_embeddings (torch.Tensor): the embeddings of the points and boxes
-          sparse_prompt_key_padding_mask (torch.Tensor or none): optional
+          sparse_key_padding_mask (torch.Tensor or none): optional
             padding mask for sparse prompt embeddings, with shape BxN and
             `True` indicating padding.
           dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
@@ -140,7 +140,7 @@ class MaskDecoder(nn.Module):
             image_embeddings=image_embeddings,
             image_pe=image_pe,
             sparse_prompt_embeddings=sparse_prompt_embeddings,
-            sparse_prompt_key_padding_mask=sparse_prompt_key_padding_mask,
+            sparse_key_padding_mask=sparse_key_padding_mask,
             dense_prompt_embeddings=dense_prompt_embeddings,
             repeat_image=repeat_image,
             high_res_features=high_res_features,
@@ -177,7 +177,7 @@ class MaskDecoder(nn.Module):
         dense_prompt_embeddings: torch.Tensor,
         repeat_image: bool,
         high_res_features: Optional[List[torch.Tensor]] = None,
-        sparse_prompt_key_padding_mask: Optional[torch.Tensor] = None,
+        sparse_key_padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predicts masks. See 'forward' for more details."""
         # Concatenate output tokens
@@ -200,24 +200,24 @@ class MaskDecoder(nn.Module):
             sparse_prompt_embeddings.size(0), -1, -1
         )
         tokens = torch.cat((output_tokens, sparse_prompt_embeddings), dim=1)
-        if sparse_prompt_key_padding_mask is None:
+        if sparse_key_padding_mask is None:
             tokens_key_padding_mask = None
         else:
-            if sparse_prompt_key_padding_mask.dtype is not torch.bool:
+            if sparse_key_padding_mask.dtype is not torch.bool:
                 raise AssertionError(
-                    "sparse_prompt_key_padding_mask must be torch.bool when provided"
+                    "sparse_key_padding_mask must be torch.bool when provided"
                 )
-            if sparse_prompt_key_padding_mask.shape != sparse_prompt_embeddings.shape[:2]:
+            if sparse_key_padding_mask.shape != sparse_prompt_embeddings.shape[:2]:
                 raise AssertionError(
-                    "sparse_prompt_key_padding_mask must have shape [B, num_sparse_prompt_tokens]"
+                    "sparse_key_padding_mask must have shape [B, num_sparse_prompt_tokens]"
                 )
             output_tokens_key_padding_mask = torch.zeros(
                 output_tokens.shape[:2],
                 dtype=torch.bool,
-                device=sparse_prompt_key_padding_mask.device,
+                device=sparse_key_padding_mask.device,
             )
             tokens_key_padding_mask = torch.cat(
-                [output_tokens_key_padding_mask, sparse_prompt_key_padding_mask],
+                [output_tokens_key_padding_mask, sparse_key_padding_mask],
                 dim=1,
             )
 
