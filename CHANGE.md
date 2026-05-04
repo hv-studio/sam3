@@ -371,6 +371,39 @@ Risk / behavior notes:
   are optional, and old callers that ignore prompt padding continue to get the
   previous behavior.
 
+### 7.1 Unify Low-Level Key-Padding-Mask Semantics
+
+Files:
+
+- `sam3/sam/transformer.py`
+- `sam3/model/decoder.py`
+
+What changed:
+
+- Low-level SAM3 attention modules now keep only the standard
+  `key_padding_mask` interface, with:
+  - `True = padding`
+  - `False = valid`
+- The higher-level memory wrappers keep their existing public
+  `memory_key_padding_mask` contract, with:
+  - `True = valid`
+  - `False = padding`
+  and flip it once before calling the shared low-level attention helpers.
+
+Why:
+
+- `sam3/sam/transformer.py` and the low-level RoPE helpers in
+  `sam3/model/decoder.py` are neural-network implementation files. They should
+  not encode caller-specific naming or carry two opposite mask conventions at
+  the same abstraction level.
+
+Risk / behavior notes:
+
+- This does not change the public memory-path contract used by SAM3 callers.
+- The cleanup is internal to the low-level attention modules and keeps prompt
+  and memory call sites semantically aligned around a single bottom-layer mask
+  convention.
+
 ## MDSTL-Side Contract
 
 MDSTL mirrors these SAM3 changes at the integration boundary:

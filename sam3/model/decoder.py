@@ -31,25 +31,15 @@ from .model_misc import (
 
 
 # >>> START PATCH: masked memory attention >>>
-def _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask: Optional[Tensor], q: Tensor) -> Optional[Tensor]:
-    if memory_key_padding_mask is None:
+def _key_padding_mask_to_attn_mask(key_padding_mask: Optional[Tensor], q: Tensor) -> Optional[Tensor]:
+    if key_padding_mask is None:
         return None
-    if memory_key_padding_mask.dtype is not torch.bool:
-        raise AssertionError(
-            "memory_key_padding_mask must be torch.bool when provided"
-        )
-    if memory_key_padding_mask.dim() != 2:
-        raise AssertionError(
-            "memory_key_padding_mask must have shape [B, memory_len]"
-        )
-    # memory_key_padding_mask uses True=valid and False=padding.
-    padding_mask = (~memory_key_padding_mask).to(device=q.device)
     attn_mask = torch.zeros(
-        (padding_mask.shape[0], 1, 1, padding_mask.shape[1]),
+        (key_padding_mask.shape[0], 1, 1, key_padding_mask.shape[1]),
         dtype=q.dtype,
         device=q.device,
     )
-    attn_mask.masked_fill_(padding_mask[:, None, None, :], float("-inf"))
+    attn_mask.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
     return attn_mask
 # <<< END PATCH <<<
 
@@ -931,6 +921,7 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attn_image, RoPEAttention)
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+        key_padding_mask = None if memory_key_padding_mask is None else ~memory_key_padding_mask
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
@@ -938,7 +929,7 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
             q=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
             k=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
             v=memory,
-            memory_key_padding_mask=memory_key_padding_mask,
+            key_padding_mask=key_padding_mask,
             **kwds,
         )
         tgt = tgt + self.dropout2(tgt2)
@@ -997,7 +988,7 @@ def functional_attention(
     use_fa3: bool = False,
     use_rope_real: bool = False,
     rope_k_repeat: bool,
-    memory_key_padding_mask: Optional[Tensor] = None,
+    key_padding_mask: Optional[Tensor] = None,
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:
     b, n, cq = q.shape
     _, m, ck = k.shape
@@ -1031,7 +1022,7 @@ def functional_attention(
                 repeat_freqs_k=rope_k_repeat,
             )
 
-    attn_mask = _memory_key_padding_mask_to_attn_mask(memory_key_padding_mask, q)
+    attn_mask = _key_padding_mask_to_attn_mask(key_padding_mask, q)
 
     if use_fa3 and attn_mask is None:
         from sam3.perflib.fa3 import flash_attn_func
@@ -1091,7 +1082,7 @@ class SimpleRoPEAttention(nn.Module):
         k: Tensor,
         v: Tensor,
         num_k_exclude_rope: int = 0,
-        memory_key_padding_mask: Optional[Tensor] = None,
+        key_padding_mask: Optional[Tensor] = None,
     ) -> Union[Tensor, tuple[Tensor, Tensor]]:
         # Apply rotary position encoding
         w = h = math.sqrt(q.shape[-2])
@@ -1118,7 +1109,7 @@ class SimpleRoPEAttention(nn.Module):
             use_fa3=self.use_fa3,
             use_rope_real=self.use_rope_real,
             rope_k_repeat=self.rope_k_repeat,
-            memory_key_padding_mask=memory_key_padding_mask,
+            key_padding_mask=key_padding_mask,
         )
 
         return out
@@ -1216,6 +1207,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attention_rope, SimpleRoPEAttention)
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+        key_padding_mask = None if memory_key_padding_mask is None else ~memory_key_padding_mask
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
@@ -1228,7 +1220,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
             k = k + memory_image_pos
         v = self.cross_attn_v_proj(memory)
 
-        out = self.cross_attention_rope(q, k, v, memory_key_padding_mask=memory_key_padding_mask, **kwds)
+        out = self.cross_attention_rope(q, k, v, key_padding_mask=key_padding_mask, **kwds)
         tgt2 = self.cross_attn_out_proj(out)
 
         tgt = tgt + self.dropout2(tgt2)
