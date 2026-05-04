@@ -203,14 +203,6 @@ class MaskDecoder(nn.Module):
         if sparse_key_padding_mask is None:
             tokens_key_padding_mask = None
         else:
-            if sparse_key_padding_mask.dtype is not torch.bool:
-                raise AssertionError(
-                    "sparse_key_padding_mask must be torch.bool when provided"
-                )
-            if sparse_key_padding_mask.shape != sparse_prompt_embeddings.shape[:2]:
-                raise AssertionError(
-                    "sparse_key_padding_mask must have shape [B, num_sparse_prompt_tokens]"
-                )
             output_tokens_key_padding_mask = torch.zeros(
                 output_tokens.shape[:2],
                 dtype=torch.bool,
