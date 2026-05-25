@@ -26,8 +26,11 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         clear_non_cond_mem_around_input=False,
         # whether to also clear non-conditioning memory of the surrounding frames (only effective when `clear_non_cond_mem_around_input` is True).
         clear_non_cond_mem_for_multi_obj=False,
-        # if fill_hole_area > 0, we fill small holes in the final masks up to this area (after resizing them to the original video resolution)
+        # if fill_hole_area > 0, fill small holes in mask logits up to this area.
         fill_hole_area=0,
+        # whether to apply fill_hole_area on low-resolution logits before resizing to video resolution.
+        # the default keeps the original predictor behavior of filling video-resolution logits.
+        fill_hole_in_low_res=False,
         # if always_start_from_first_ann_frame is True, we always start tracking from the frame where we receive the first annotation (clicks or mask)
         # and ignore the `start_frame_idx` passed to `propagate_in_video`
         always_start_from_first_ann_frame=False,
@@ -44,6 +47,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
         self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
         self.fill_hole_area = fill_hole_area
+        self.fill_hole_in_low_res = fill_hole_in_low_res
         self.always_start_from_first_ann_frame = always_start_from_first_ann_frame
         self.max_point_num_in_prompt_enc = max_point_num_in_prompt_enc
         self.non_overlap_masks_for_output = non_overlap_masks_for_output
@@ -518,7 +522,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
         if self.non_overlap_masks_for_output:
             video_res_masks = self._apply_non_overlapping_constraints(video_res_masks)
         # potentially fill holes in the predicted masks
-        if self.fill_hole_area > 0:
+        if self.fill_hole_area > 0 and not self.fill_hole_in_low_res:
             video_res_masks = fill_holes_in_mask_scores(
                 video_res_masks, self.fill_hole_area
             )
@@ -581,14 +585,13 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 dtype=torch.float32,
                 device=inference_state["device"],
             ),
-        }
-        if self.use_memory_selection:
-            consolidated_out["iou_score"] = torch.full(
+            "iou_score": torch.full(
                 size=(batch_size, 1),
                 fill_value=0.0,
                 dtype=torch.float32,
                 device=inference_state["device"],
-            )
+            ),
+        }
         empty_mask_ptr = None
         for obj_idx in range(batch_size):
             obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
@@ -638,8 +641,7 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             consolidated_out["object_score_logits"][obj_idx : obj_idx + 1] = out[
                 "object_score_logits"
             ]
-            if self.use_memory_selection:
-                consolidated_out["iou_score"][obj_idx : obj_idx + 1] = out["iou_score"]
+            consolidated_out["iou_score"][obj_idx : obj_idx + 1] = out["iou_score"]
         # Optionally, apply non-overlapping constraints on the consolidated scores
         # and rerun the memory encoder
         if run_mem_encoder:
@@ -929,9 +931,8 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
                 "pred_masks": current_out["pred_masks"][obj_slice],
                 "obj_ptr": current_out["obj_ptr"][obj_slice],
                 "object_score_logits": current_out["object_score_logits"][obj_slice],
+                "iou_score": current_out["iou_score"][obj_slice],
             }
-            if self.use_memory_selection:
-                obj_out["iou_score"] = current_out["iou_score"][obj_slice]
             if maskmem_features is not None:
                 obj_out["maskmem_features"] = maskmem_features[obj_slice]
             if maskmem_pos_enc is not None:
@@ -1132,12 +1133,29 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             maskmem_features = maskmem_features.to(torch.bfloat16)
             maskmem_features = maskmem_features.to(storage_device, non_blocking=True)
         pred_masks_gpu = current_out["pred_masks"]
+        if self.fill_hole_area > 0 and self.fill_hole_in_low_res:
+            if pred_masks_gpu.shape[1] == 1:
+                pred_masks_gpu = fill_holes_in_mask_scores(
+                    pred_masks_gpu, self.fill_hole_area
+                )
+            else:
+                pred_masks_gpu = torch.cat(
+                    [
+                        fill_holes_in_mask_scores(
+                            pred_masks_gpu[:, mask_idx : mask_idx + 1],
+                            self.fill_hole_area,
+                        )
+                        for mask_idx in range(pred_masks_gpu.shape[1])
+                    ],
+                    dim=1,
+                )
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=True)
         # "maskmem_pos_enc" is the same across frames, so we only need to store one copy of it
         maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
         # object pointer is a small tensor, so we always keep it on GPU memory for fast access
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out["object_score_logits"]
+        iou_score = current_out["iou_score"]
         # make a compact version of this frame's output to reduce the state size
         compact_current_out = {
             "maskmem_features": maskmem_features,
@@ -1145,9 +1163,9 @@ class Sam3TrackerPredictor(Sam3TrackerBase):
             "pred_masks": pred_masks,
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
+            "iou_score": iou_score,
         }
         if self.use_memory_selection:
-            compact_current_out["iou_score"] = current_out["iou_score"]
             compact_current_out["eff_iou_score"] = current_out["eff_iou_score"]
         return compact_current_out, pred_masks_gpu
 

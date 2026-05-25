@@ -1008,10 +1008,10 @@ class Sam3TrackerBase(torch.nn.Module):
         current_out["pred_masks"] = low_res_masks
         current_out["pred_masks_high_res"] = high_res_masks
         current_out["obj_ptr"] = obj_ptr
+        iou_score = ious.max(-1)[0]
+        current_out["iou_score"] = iou_score
         if self.use_memory_selection:
             current_out["object_score_logits"] = object_score_logits
-            iou_score = ious.max(-1)[0]
-            current_out["iou_score"] = iou_score
             current_out["eff_iou_score"] = self.cal_mem_score(
                 object_score_logits, iou_score
             )
