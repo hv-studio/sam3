@@ -3,6 +3,7 @@
 # pyre-unsafe
 
 import os
+from functools import wraps
 from typing import Optional
 
 import pkg_resources
@@ -47,30 +48,33 @@ from sam3.model.tokenizer_ve import SimpleTokenizer
 from sam3.model.video_tracking_multiplex import VideoTrackingDynamicMultiplex
 from sam3.model.vitdet import ViT
 from sam3.model.vl_combiner import SAM3VLBackbone, SAM3VLBackboneTri, TriHeadVisionOnly
+from sam3.perflib.compile import sam3_inference_context
 from sam3.sam.transformer import RoPEAttention
 
 
-# Setup TensorFloat-32 for Ampere GPUs if available
-def _setup_tf32() -> None:
-    """Enable TensorFloat-32 for Ampere GPUs if available."""
-    if torch.cuda.is_available():
-        device_props = torch.cuda.get_device_properties(0)
-        if device_props.major >= 8:
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
+# >>> CHANGE: do not mutate TF32 backend flags at import time. <<<
+# Original SAM3 implementation:
+# def _setup_tf32() -> None:
+#     """Enable TensorFloat-32 for Ampere GPUs if available."""
+#     if torch.cuda.is_available():
+#         device_props = torch.cuda.get_device_properties(0)
+#         if device_props.major >= 8:
+#             torch.backends.cuda.matmul.allow_tf32 = True
+#             torch.backends.cudnn.allow_tf32 = True
+#
+#
+# _setup_tf32()
 
 
-_setup_tf32()
-
-
-def _create_position_encoding(precompute_resolution=None):
+# >>> CHANGE: rename the position-cache knob to `resolution` for builder consistency. <<<
+def _create_position_encoding(resolution=None):
     """Create position encoding for visual backbone."""
     return PositionEmbeddingSine(
         num_pos_feats=256,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=precompute_resolution,
+        precompute_resolution=resolution,
     )
 
 
@@ -162,7 +166,10 @@ def _create_transformer_encoder(use_fa3=False) -> TransformerEncoderFusion:
     return encoder
 
 
-def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
+# >>> CHANGE: make resolution and stride optional <<<
+def _create_transformer_decoder(
+    use_fa3=False, *, resolution: int | None = 1008, stride: int | None = 14,
+) -> TransformerDecoder:
     """Create transformer decoder with its layer."""
     decoder_layer = TransformerDecoderLayer(
         activation="relu",
@@ -192,8 +199,8 @@ def _create_transformer_decoder(use_fa3=False) -> TransformerDecoder:
         frozen=False,
         interaction_layer=None,
         dac_use_selfatt_ln=True,
-        resolution=1008,
-        stride=14,
+        resolution=resolution,
+        stride=stride,
         use_act_checkpoint=True,
         presence_token=True,
     )
@@ -341,16 +348,23 @@ def _create_sam3_model(
     return model
 
 
-def _create_tracker_maskmem_backbone():
-    """Create the SAM3 Tracker memory encoder."""
-    # Position encoding for mask memory backbone
-    position_encoding = PositionEmbeddingSine(
+# >>> CHANGE: split tracker maskmem position encoding into a reusable builder helper. <<<
+def _create_tracker_maskmem_position_encoding(*, resolution: int | None = 1008):
+    """Create tracker mask-memory position encoding."""
+    return PositionEmbeddingSine(
         num_pos_feats=64,
         normalize=True,
         scale=None,
         temperature=10000,
-        precompute_resolution=1008,
+        precompute_resolution=resolution,
     )
+
+
+# >>> CHANGE: make tracker maskmem position-cache resolution optional. <<<
+def _create_tracker_maskmem_backbone(*, resolution: int | None = 1008):
+    """Create the SAM3 Tracker memory encoder."""
+    # Position encoding for mask memory backbone
+    position_encoding = _create_tracker_maskmem_position_encoding(resolution=resolution)
 
     # Mask processing components
     mask_downsampler = SimpleMaskDownSampler(
@@ -509,12 +523,13 @@ def _create_text_encoder(bpe_path: str) -> VETextEncoder:
     )
 
 
+# >>> CHANGE: make visual-backbone position-cache resolution optional. <<<
 def _create_vision_backbone(
-    compile_mode=None, enable_inst_interactivity=True
+    compile_mode=None, enable_inst_interactivity=True, *, resolution: int | None = 1008,
 ) -> Sam3DualViTDetNeck:
     """Create SAM3 visual backbone with ViT and neck."""
     # Position encoding
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(resolution=resolution)
     # ViT backbone
     vit_backbone: ViT = _create_vit_backbone(compile_mode=compile_mode)
     vit_neck: Sam3DualViTDetNeck = _create_vit_neck(
@@ -526,12 +541,18 @@ def _create_vision_backbone(
     return vit_neck
 
 
+# >>> CHANGE: make resolution and stride optional <<<
 def _create_sam3_transformer(
-    has_presence_token: bool = True, use_fa3: bool = False
+    has_presence_token: bool = True, use_fa3: bool = False,
+    *,
+    resolution: int | None = 1008, stride: int | None = 14,
 ) -> TransformerWrapper:
-    """Create SAM3 transformer encoder and decoder."""
+    """
+    Create SAM3 transformer encoder and decoder.
+    Set `resolution=None & stride=None` to prevent from precaching CUDA values.
+    """
     encoder: TransformerEncoderFusion = _create_transformer_encoder(use_fa3=use_fa3)
-    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3)
+    decoder: TransformerDecoder = _create_transformer_decoder(use_fa3=use_fa3, resolution=resolution, stride=stride)
 
     return TransformerWrapper(encoder=encoder, decoder=decoder, d_model=256)
 
@@ -567,6 +588,20 @@ def _setup_device_and_mode(model, device, eval_mode):
         model = model.cuda()
     if eval_mode:
         model.eval()
+    return model
+
+
+# >>> CHANGE: preserve SAM3's original TF32 preference without import-time globals. <<<
+def _wrap_model_forward_with_sam3_context(model, *, autocast_dtype=None):
+    """Wrap a public model forward with scoped SAM3 backend precision policy."""
+    original_forward = model.forward
+
+    @wraps(original_forward)
+    def wrapped_forward(*args, **kwargs):
+        with sam3_inference_context(allow_tf32=True, autocast_dtype=autocast_dtype):
+            return original_forward(*args, **kwargs)
+
+    model.forward = wrapped_forward
     return model
 
 
@@ -651,7 +686,10 @@ def build_sam3_image_model(
     # Setup device and mode
     model = _setup_device_and_mode(model, device, eval_mode)
 
-    return model
+    # >>> CHANGE: direct image-model users keep SAM3's TF32 preference only during forward. <<<
+    # Original SAM3 implementation:
+    # return model
+    return _wrap_model_forward_with_sam3_context(model, autocast_dtype=None)
 
 
 def download_ckpt_from_hf(version="sam3"):
@@ -921,7 +959,7 @@ def _create_multiplex_tri_backbone(
     compile_mode=None, use_fa3=False, use_rope_real=False
 ):
     """Create the TriHead vision backbone for multiplex model."""
-    position_encoding = _create_position_encoding(precompute_resolution=1008)
+    position_encoding = _create_position_encoding(resolution=1008)
     vit_backbone = _create_vit_backbone(
         compile_mode=compile_mode, use_fa3=use_fa3, use_rope_real=use_rope_real
     )

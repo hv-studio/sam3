@@ -19,7 +19,12 @@ from sam3.model.io_utils import IMAGE_EXTS, load_resource_as_video_frames
 from sam3.model.sam3_tracker_utils import fill_holes_in_mask_scores
 from sam3.model.sam3_video_base import MaskletConfirmationStatus, Sam3VideoBase
 from sam3.model.utils.misc import copy_data_to_device
-from sam3.perflib.compile import compile_wrapper, shape_logging_wrapper
+from sam3.perflib.compile import (
+    SAM3_COMPILE_DYNAMO_CONFIG,
+    compile_with_dynamo_config,
+    compile_wrapper,
+    shape_logging_wrapper,
+)
 from sam3.perflib.masks_ops import masks_to_boxes as perf_masks_to_boxes
 from torchvision.ops import masks_to_boxes
 from tqdm.auto import tqdm
@@ -577,14 +582,14 @@ class Sam3VideoInference(Sam3VideoBase):
         if is_compiled or not self.compile_model:
             return
 
-        import torch._dynamo
-
-        # a larger cache size to hold varying number of shapes for torch.compile
-        # see https://github.com/pytorch/pytorch/blob/v2.5.1/torch/_dynamo/config.py#L42-L49
-        torch._dynamo.config.cache_size_limit = 128
-        torch._dynamo.config.accumulated_cache_size_limit = 2048
-        torch._dynamo.config.capture_scalar_outputs = True
-        torch._dynamo.config.suppress_errors = True
+        # >>> CHANGE: scope Dynamo config to compiled call execution instead of mutating process globals. <<<
+        # Original SAM3 implementation:
+        # import torch._dynamo
+        # torch._dynamo.config.cache_size_limit = 128
+        # torch._dynamo.config.accumulated_cache_size_limit = 2048
+        # torch._dynamo.config.capture_scalar_outputs = True
+        # torch._dynamo.config.suppress_errors = True
+        compile_config = SAM3_COMPILE_DYNAMO_CONFIG
 
         # Compile module components
         # skip compilation of `_encode_prompt` since it sometimes tiggger SymInt errors
@@ -593,43 +598,60 @@ class Sam3VideoInference(Sam3VideoBase):
         # )
 
         ## Compile SAM3 model components
+        # >>> CHANGE: use scoped Dynamo config wrappers around lazy torch.compile callables. <<<
+        # Original SAM3 implementation used bare torch.compile(...) in each clone_output_wrapper.
+        # Example:
+        # self.detector.backbone.vision_backbone.forward = clone_output_wrapper(
+        #     torch.compile(
+        #         self.detector.backbone.vision_backbone.forward,
+        #         fullgraph=True,
+        #         mode="max-autotune",
+        #     )
+        # )
         self.detector.backbone.vision_backbone.forward = clone_output_wrapper(
-            torch.compile(
+            compile_with_dynamo_config(
                 self.detector.backbone.vision_backbone.forward,
                 fullgraph=True,
                 mode="max-autotune",
+                config=compile_config,
             )
         )
         self.detector.transformer.encoder.forward = clone_output_wrapper(
-            torch.compile(
+            compile_with_dynamo_config(
                 self.detector.transformer.encoder.forward,
                 fullgraph=True,
                 mode="max-autotune",
+                config=compile_config,
             )
         )
         self.detector.transformer.decoder.forward = clone_output_wrapper(
-            torch.compile(
+            compile_with_dynamo_config(
                 self.detector.transformer.decoder.forward,
                 fullgraph=True,
                 mode="max-autotune",
                 dynamic=False,
+                config=compile_config,
             )
         )
 
         self.detector.segmentation_head.forward = clone_output_wrapper(
-            torch.compile(
+            compile_with_dynamo_config(
                 self.detector.segmentation_head.forward,
                 fullgraph=True,
                 mode="max-autotune",
+                config=compile_config,
             )
         )
 
         ## Compile Tracker model components
+        # >>> CHANGE: preserve original compile_wrapper calls, but pass scoped Dynamo config. <<<
+        # Original SAM3 implementation called compile_wrapper(...) without config=compile_config.
         self.tracker.maskmem_backbone.forward = compile_wrapper(
             self.tracker.maskmem_backbone.forward,
             mode="max-autotune-no-cudagraphs",
             fullgraph=True,
             dynamic=False,
+            config=compile_config,
         )
 
         self.tracker.transformer.encoder.forward = shape_logging_wrapper(
@@ -638,6 +660,7 @@ class Sam3VideoInference(Sam3VideoBase):
                 mode="max-autotune-no-cudagraphs",
                 fullgraph=True,
                 dynamic=True,
+                config=compile_config,
             ),
             keep_kwargs=["src", "src_pos", "prompt", "prompt_pos"],
         )
@@ -647,6 +670,7 @@ class Sam3VideoInference(Sam3VideoBase):
             mode="max-autotune",
             fullgraph=True,
             dynamic=False,  # Accuracy regression on True
+            config=compile_config,
         )
 
         self._model_is_compiled = True

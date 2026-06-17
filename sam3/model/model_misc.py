@@ -70,6 +70,7 @@ def get_sdpa_settings():
 OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
 
 
+# >>> CHANGE: keep compile-state policy helpers out of SAM3; MDSTL owns the boundary. <<<
 class AttentionType:
     """Type of attention"""
 
@@ -249,20 +250,10 @@ def multi_head_attention_forward(
                 f"Only float, byte, and bool types are supported for attn_mask, not {attn_mask.dtype}"
             )
         # ensure attn_mask's dim is 3
+        # >>> CHANGE: drop Python shape equality checks; MDSTL uses static mask shapes at the boundary. <<<
         if attn_mask.dim() == 2:
-            correct_2d_size = (tgt_len, src_len)
-            if attn_mask.shape != correct_2d_size:
-                raise RuntimeError(
-                    f"The shape of the 2D attn_mask is {attn_mask.shape}, but should be {correct_2d_size}."
-                )
             attn_mask = attn_mask.unsqueeze(0)
-        elif attn_mask.dim() == 3:
-            correct_3d_size = (bsz * num_heads, tgt_len, src_len)
-            if attn_mask.shape != correct_3d_size:
-                raise RuntimeError(
-                    f"The shape of the 3D attn_mask is {attn_mask.shape}, but should be {correct_3d_size}."
-                )
-        else:
+        elif attn_mask.dim() != 3:
             raise RuntimeError(
                 f"attn_mask's dimension {attn_mask.dim()} is not supported"
             )
@@ -390,10 +381,7 @@ def multi_head_attention_forward(
                 q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
             ).transpose(1, 2)
         else:
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-
+            # >>> CHANGE: leave SDPA backend policy to the MDSTL SAM3 Guider boundary. <<<
             attn_output = F.scaled_dot_product_attention(
                 q, k, v, attn_mask, dropout_p, is_causal
             )

@@ -16,7 +16,7 @@ import torch.nn.functional as torchF
 from sam3.sam.rope import apply_rotary_enc, apply_rotary_enc_real, compute_axial_cis
 from sam3.sam.transformer import RoPEAttention
 from torch import nn, Tensor
-from torch.nn.attention import sdpa_kernel, SDPBackend
+# >>> CHANGE: do not import SDPA policy helpers in SAM3; MDSTL wraps the boundary. <<<
 from torchvision.ops.roi_align import RoIAlign
 
 from .act_ckpt_utils import activation_ckpt_wrapper
@@ -28,6 +28,20 @@ from .model_misc import (
     inverse_sigmoid,
     MLP,
 )
+
+
+# >>> START PATCH: masked memory attention >>>
+def _key_padding_mask_to_attn_mask(key_padding_mask: Optional[Tensor], q: Tensor) -> Optional[Tensor]:
+    if key_padding_mask is None:
+        return None
+    attn_mask = torch.zeros(
+        (key_padding_mask.shape[0], 1, 1, key_padding_mask.shape[1]),
+        dtype=q.dtype,
+        device=q.device,
+    )
+    attn_mask.masked_fill_(key_padding_mask[:, None, None, :], float("-inf"))
+    return attn_mask
+# <<< END PATCH <<<
 
 
 class TransformerDecoderLayer(nn.Module):
@@ -898,7 +912,8 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
         tgt = tgt + self.dropout1(tgt2)
         return tgt
 
-    def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0):
+    def _forward_ca(self, tgt, memory, query_pos, pos, num_k_exclude_rope=0,
+                    memory_key_padding_mask: Optional[Tensor] = None):
         if self.cross_attn_image is None:
             return tgt
 
@@ -906,6 +921,7 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attn_image, RoPEAttention)
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+        key_padding_mask = None if memory_key_padding_mask is None else ~memory_key_padding_mask
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
@@ -913,6 +929,7 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
             q=tgt2 + query_pos if self.pos_enc_at_cross_attn_queries else tgt2,
             k=memory + pos if self.pos_enc_at_cross_attn_keys else memory,
             v=memory,
+            key_padding_mask=key_padding_mask,
             **kwds,
         )
         tgt = tgt + self.dropout2(tgt2)
@@ -936,15 +953,14 @@ class TransformerDecoderLayerv2(TransformerDecoderLayerv1):
         assert tgt_mask is None
         assert memory_mask is None
         assert tgt_key_padding_mask is None
-        assert memory_key_padding_mask is None
         assert attn_bias is None
 
         if self.cross_attention_first:
-            tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
+            tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope, memory_key_padding_mask)
             tgt = self._forward_sa(tgt, query_pos)
         else:
             tgt = self._forward_sa(tgt, query_pos)
-            tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope)
+            tgt = self._forward_ca(tgt, memory, query_pos, pos, num_k_exclude_rope, memory_key_padding_mask)
 
         # MLP
         tgt2 = self.norm3(tgt)
@@ -972,6 +988,7 @@ def functional_attention(
     use_fa3: bool = False,
     use_rope_real: bool = False,
     rope_k_repeat: bool,
+    key_padding_mask: Optional[Tensor] = None,
 ) -> Union[Tensor, tuple[Tensor, Tensor]]:
     b, n, cq = q.shape
     _, m, ck = k.shape
@@ -1005,14 +1022,16 @@ def functional_attention(
                 repeat_freqs_k=rope_k_repeat,
             )
 
-    if use_fa3:
+    attn_mask = _key_padding_mask_to_attn_mask(key_padding_mask, q)
+
+    if use_fa3 and attn_mask is None:
         from sam3.perflib.fa3 import flash_attn_func
 
         assert dropout == 0.0
         out = flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2))
     else:
-        with sdpa_kernel(SDPBackend.FLASH_ATTENTION):
-            out = torchF.scaled_dot_product_attention(q, k, v, dropout_p=dropout)
+        # >>> CHANGE: leave SDPA backend policy to the MDSTL SAM3 Guider boundary. <<<
+        out = torchF.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=dropout)
         out = out.transpose(1, 2)  #  B * n * n_heads * (cv // num_heads)
 
     out = out.reshape(b, n, cv)
@@ -1063,6 +1082,7 @@ class SimpleRoPEAttention(nn.Module):
         k: Tensor,
         v: Tensor,
         num_k_exclude_rope: int = 0,
+        key_padding_mask: Optional[Tensor] = None,
     ) -> Union[Tensor, tuple[Tensor, Tensor]]:
         # Apply rotary position encoding
         w = h = math.sqrt(q.shape[-2])
@@ -1089,6 +1109,7 @@ class SimpleRoPEAttention(nn.Module):
             use_fa3=self.use_fa3,
             use_rope_real=self.use_rope_real,
             rope_k_repeat=self.rope_k_repeat,
+            key_padding_mask=key_padding_mask,
         )
 
         return out
@@ -1180,11 +1201,13 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
         query_pos,
         memory_image_pos,
         num_k_exclude_rope=0,
+        memory_key_padding_mask: Optional[Tensor] = None,
     ):
         kwds = {}
         if num_k_exclude_rope > 0:
             assert isinstance(self.cross_attention_rope, SimpleRoPEAttention)
             kwds = {"num_k_exclude_rope": num_k_exclude_rope}
+        key_padding_mask = None if memory_key_padding_mask is None else ~memory_key_padding_mask
 
         # Cross-Attention
         tgt2 = self.norm2(tgt)
@@ -1197,7 +1220,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
             k = k + memory_image_pos
         v = self.cross_attn_v_proj(memory)
 
-        out = self.cross_attention_rope(q, k, v, **kwds)
+        out = self.cross_attention_rope(q, k, v, key_padding_mask=key_padding_mask, **kwds)
         tgt2 = self.cross_attn_out_proj(out)
 
         tgt = tgt + self.dropout2(tgt2)
@@ -1215,6 +1238,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
         memory_image_pos: Optional[Tensor] = None,
         memory_pos: Optional[Tensor] = None,
         num_k_exclude_rope: int = 0,
+        memory_key_padding_mask: Optional[Tensor] = None,
     ):
         if self.cross_attention_first:
             tgt = self._forward_ca(
@@ -1225,6 +1249,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
                 query_pos=query_pos,
                 memory_image_pos=memory_image_pos,
                 num_k_exclude_rope=num_k_exclude_rope,
+                memory_key_padding_mask=memory_key_padding_mask,
             )
             tgt = self._forward_sa(tgt, query_pos)
         else:
@@ -1237,6 +1262,7 @@ class DecoupledTransformerDecoderLayerv2(nn.Module):
                 query_pos=query_pos,
                 memory_image_pos=memory_image_pos,
                 num_k_exclude_rope=num_k_exclude_rope,
+                memory_key_padding_mask=memory_key_padding_mask,
             )
 
         # MLP
@@ -1290,6 +1316,7 @@ class TransformerEncoderDecoupledCrossAttention(nn.Module):
         memory_image_pos: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
         memory_pos: Optional[Tensor] = None,  # pos_enc for cross-attention inputs
         num_obj_ptr_tokens: int = 0,  # number of object pointer *tokens*
+        memory_key_padding_mask: Optional[Tensor] = None,  # [B, memory_len], True=valid, False=padding
     ):
         assert src.shape[1] == memory.shape[1], (
             "Batch size must be the same for src and memory"
@@ -1356,6 +1383,7 @@ class TransformerEncoderDecoupledCrossAttention(nn.Module):
                 memory_image_pos=memory_image_pos,
                 memory_pos=memory_pos,
                 num_k_exclude_rope=num_obj_ptr_tokens,
+                memory_key_padding_mask=memory_key_padding_mask,
                 act_ckpt_enable=self.training and self.use_act_checkpoint,
             )
 

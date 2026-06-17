@@ -9,6 +9,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
+from sam3.perflib.compile import (
+    SAM3_ACT_CKPT_DYNAMO_CONFIG,
+    compile_with_dynamo_config,
+)
 
 from .model_misc import MLP
 
@@ -206,11 +210,20 @@ class PixelDecoder(nn.Module):
         self.shared_conv = shared_conv
         self.out_dim = self.conv_layers[-1].out_channels
         if compile_mode is not None:
-            self.forward = torch.compile(
-                self.forward, mode=compile_mode, dynamic=True, fullgraph=True
+            # >>> CHANGE: scope activation-checkpoint Dynamo-DDP config to compiled calls. <<<
+            # Original SAM3 implementation:
+            # self.forward = torch.compile(
+            #     self.forward, mode=compile_mode, dynamic=True, fullgraph=True
+            # )
+            # # Needed to make checkpointing happy. But we don't know if the module is checkpointed, so we disable it by default.
+            # torch._dynamo.config.optimize_ddp = False
+            self.forward = compile_with_dynamo_config(
+                self.forward,
+                mode=compile_mode,
+                dynamic=True,
+                fullgraph=True,
+                config=SAM3_ACT_CKPT_DYNAMO_CONFIG,
             )
-            # Needed to make checkpointing happy. But we don't know if the module is checkpointed, so we disable it by default.
-            torch._dynamo.config.optimize_ddp = False
 
     def forward(self, backbone_feats: List[torch.Tensor]):
         # Assumes backbone features are already projected (C == hidden dim)

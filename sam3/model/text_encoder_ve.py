@@ -7,6 +7,10 @@ from typing import Callable, List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from sam3.perflib.compile import (
+    SAM3_ACT_CKPT_DYNAMO_CONFIG,
+    compile_with_dynamo_config,
+)
 from torch.utils.checkpoint import checkpoint
 
 from .model_misc import LayerScale
@@ -121,11 +125,19 @@ class Transformer(nn.Module):
         )
 
         if compile_mode is not None:
-            self.forward = torch.compile(
-                self.forward, mode=compile_mode, fullgraph=True
+            # >>> CHANGE: scope activation-checkpoint Dynamo-DDP config to compiled calls. <<<
+            # Original SAM3 implementation:
+            # self.forward = torch.compile(
+            #     self.forward, mode=compile_mode, fullgraph=True
+            # )
+            # if self.grad_checkpointing:
+            #     torch._dynamo.config.optimize_ddp = False
+            self.forward = compile_with_dynamo_config(
+                self.forward,
+                mode=compile_mode,
+                fullgraph=True,
+                config=SAM3_ACT_CKPT_DYNAMO_CONFIG if self.grad_checkpointing else None,
             )
-            if self.grad_checkpointing:
-                torch._dynamo.config.optimize_ddp = False
 
     def forward(
         self,
