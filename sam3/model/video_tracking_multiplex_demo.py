@@ -1276,6 +1276,7 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         Returns:
             Tuple of (frame_idx, obj_ids, low_res_masks, video_res_masks)
         """
+        is_new_object = obj_id not in inference_state["obj_id_to_idx"]
         obj_idx = self._obj_id_to_idx(inference_state, obj_id)
         obj_idxs = [obj_idx]
         obj_ids = [obj_id]
@@ -1309,7 +1310,11 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         else:
             reverse = inference_state["frames_already_tracked"][frame_idx]["reverse"]
 
-        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        is_cond = (
+            is_init_cond_frame
+            or is_new_object
+            or self.add_all_frames_to_correct_as_cond
+        )
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
 
         multiplex_state = inference_state["multiplex_state"]
@@ -1675,6 +1680,9 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         """Add new mask to a frame."""
         if isinstance(obj_ids, np.ndarray):
             obj_ids = obj_ids.tolist()
+        has_new_objects = any(
+            obj_id not in inference_state["obj_id_to_idx"] for obj_id in obj_ids
+        )
         obj_idxs = [
             self._obj_id_to_idx(inference_state, obj_id, error_if_new=reconditioning)
             for obj_id in obj_ids
@@ -1757,9 +1765,13 @@ class VideoTrackingMultiplexDemo(VideoTrackingDynamicMultiplex):
         obj_temp_output_dicts = [
             inference_state["temp_output_dict_per_obj"][obj_idx] for obj_idx in obj_idxs
         ]
-        # Add a frame to conditioning output if it's an initial conditioning frame or
-        # if the model sees all frames receiving clicks/mask as conditioning frames.
-        is_cond = is_init_cond_frame or self.add_all_frames_to_correct_as_cond
+        # A new object's first mask remains conditioning even if other objects have
+        # already tracked this frame.
+        is_cond = (
+            is_init_cond_frame
+            or has_new_objects
+            or self.add_all_frames_to_correct_as_cond
+        )
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
 
         # Allow creating a new bucket only when existing buckets cannot fit the new objects
