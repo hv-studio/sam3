@@ -21,15 +21,8 @@ class InverseSquareRootParamScheduler:
     def __call__(self, step: int, where: float):
         lr = self.base_lr
 
-        if where > 0:
-            total_steps = step / where
-            progress = (step - self.warmup_steps) / float(
-                total_steps - self.warmup_steps
-            )
-            progress = max(min(progress, 1), 0)
-        else:
-            progress = 0
-            total_steps = 1
+        # All-warmup schedules are valid; no unused progress division is needed.
+        total_steps = step / where if where > 0 else 1
 
         shift = self.timescale - self.warmup_steps
         if self.warmup_steps < step:
