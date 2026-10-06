@@ -574,7 +574,10 @@ class Attention(nn.Module):
             )
         return apply_rotary_enc(q, k, freqs_cis=self.freqs_cis)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, *, return_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        """Optionally return image K/V after RoPE, before relative-position augmentation."""
         s = 1 if self.cls_token else 0  # used to exclude cls_token
         if x.ndim == 4:
             B, H, W, _ = x.shape
@@ -594,6 +597,8 @@ class Attention(nn.Module):
 
         # handle rope and rel pos embeddings
         q, k = self._apply_rope(q, k)
+        if return_kv:
+            keys, values = k[:, :, s:], v[:, :, s:]
         if self.use_rel_pos:
             q, k = concat_rel_pos(
                 q.flatten(0, 1),
@@ -633,7 +638,7 @@ class Attention(nn.Module):
 
         x = self.proj(x)
 
-        return x
+        return (x, keys, values) if return_kv else x
 
 
 class Block(nn.Module):
@@ -725,23 +730,41 @@ class Block(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.window_size = window_size
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, *, return_kv: bool = False,
+    ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
+        """Optionally return valid image K/V as [B, heads, tokens, head_dim]."""
         shortcut = x
         x = self.norm1(x)
         # Window partition
-        if self.window_size > 0:
+        if (window_size := self.window_size) > 0:
             H, W = x.shape[1], x.shape[2]
-            x, pad_hw = window_partition(x, self.window_size)
+            x, pad_hw = window_partition(x, window_size)
 
-        x = self.ls1(self.attn(x))
+        if return_kv:
+            x, keys, values = self.attn(x, return_kv=True)
+            if window_size > 0:
+                keys, values = (
+                    window_unpartition(
+                        tokens.transpose(1, 2).reshape(
+                            len(tokens), window_size, window_size, -1
+                        ),
+                        window_size, pad_hw, (H, W),
+                    ).reshape(len(shortcut), H * W, self.attn.num_heads, -1)
+                    .transpose(1, 2)
+                    for tokens in (keys, values)
+                )
+        else:
+            x = self.attn(x)
+        x = self.ls1(x)
         # Reverse window partition
-        if self.window_size > 0:
-            x = window_unpartition(x, self.window_size, pad_hw, (H, W))
+        if window_size > 0:
+            x = window_unpartition(x, window_size, pad_hw, (H, W))
 
         x = shortcut + self.dropout(self.drop_path(x))
         x = x + self.dropout(self.drop_path(self.ls2(self.mlp(self.norm2(x)))))
 
-        return x
+        return (x, keys, values) if return_kv else x
 
 
 class ViT(nn.Module):
@@ -963,7 +986,13 @@ class ViT(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, tensor_list):
+    def forward(self, tensor_list, *, stream=None):
+        """Return native maps, optionally with corresponding external K/V stream states.
+
+        The stream exposes read_layers, init_state(batch_size), and
+        advance(layer_index, state, keys, values). Unread layers receive no K/V.
+        State stays local to this call; the caller controls gradients and freezing.
+        """
         if isinstance(tensor_list, NestedTensor):
             x = tensor_list.tensors
             mask = tensor_list.mask
@@ -992,13 +1021,18 @@ class ViT(nn.Module):
 
         x = self.ln_pre(x)
 
-        outputs = []
+        tokens, outputs, states = (stream.init_state(x.shape[0]) if stream is not None else None), [], []
         masks = None
         for i, blk in enumerate(self.blocks):
+            return_kv, keys, values = (stream is not None and i in stream.read_layers), None, None
             if self.use_act_checkpoint and self.training:
-                x = checkpoint.checkpoint(blk, x, use_reentrant=False)
+                x = checkpoint.checkpoint(blk, x, use_reentrant=False, return_kv=return_kv)
             else:
-                x = blk(x)
+                x = blk(x, return_kv=return_kv)
+            if return_kv:
+                x, keys, values = x
+            if stream is not None:
+                tokens = stream.advance(i, tokens, keys, values)
             if (i == self.full_attn_ids[-1]) or (
                 self.return_interm_layers and i in self.full_attn_ids
             ):
@@ -1024,8 +1058,10 @@ class ViT(nn.Module):
                     outputs.append(NestedTensor(feats, masks))
                 else:
                     outputs.append(feats)
+                if stream is not None:
+                    states.append(tokens)
 
-        return outputs
+        return outputs if stream is None else (outputs, states)
 
     def get_layer_id(self, layer_name: str) -> int:
         # https://github.com/microsoft/unilm/blob/master/beit/optim_factory.py#L33
